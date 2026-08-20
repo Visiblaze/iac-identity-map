@@ -74,11 +74,16 @@ jobs:
         run: terraform plan -out tfplan          # you already have this
 
       - name: Send identity map to Visiblaze
-        uses: visiblaze/iac-identity-map@<commit-sha>
+        uses: Visiblaze/iac-identity-map@<commit-sha>
         with:
-          tenant: ${{ vars.VISIBLAZE_TENANT }}
-          label: prod/eu-west-1
+          tenant:  ${{ vars.VISIBLAZE_TENANT }}
+          api-url: ${{ vars.VISIBLAZE_INGEST_URL }}
+          label:   prod/eu-west-1
 ```
+
+Both `tenant` and `api-url` come from us when your organisation is authorised. Neither is a secret —
+they are identifiers, not credentials, so repository *variables* are the right home for them rather
+than secrets.
 
 **Pin to a commit SHA, not a tag.** A tag is mutable — whoever controls this repo can move `v1`
 under you. We would rather you did not have to trust us that far, and Visiblaze pins third-party
@@ -89,6 +94,7 @@ actions the same way.
 ```yaml
   with:
     tenant:  ${{ vars.VISIBLAZE_TENANT }}
+    api-url: ${{ vars.VISIBLAZE_INGEST_URL }}
     dry-run: true
 ```
 
@@ -100,6 +106,7 @@ needs no `id-token` permission, because it never authenticates.
 | Input | Default | Notes |
 |---|---|---|
 | `tenant` | — | **Required.** A map seeded against the wrong tenant is not recoverable by re-running. |
+| `api-url` | — | **Required.** The ingest endpoint we give you. There is deliberately no default: the endpoint depends on which region your workspace lives in, and a default would be frozen the moment you pin a commit SHA — so a wrong one could never be corrected for anyone already pinned. |
 | `label` | the repository | What your team reads in *"searched **&lt;label&gt;** as of &lt;date&gt;"*. Name the **workspace** — `prod/eu-west-1`, not `acme/infra`. The repo name is a poor label for a repo holding several workspaces. |
 | `plan-file` | `tfplan` | The output of `plan -out`. |
 | `plan-json` | — | Use if your pipeline already rendered `show -json`. |

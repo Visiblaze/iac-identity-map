@@ -77,9 +77,10 @@ inputs:
     required: false
     default: terraform
   api-url:
-    description: Visiblaze ingest endpoint.
-    required: false
-    default: https://api.visiblaze.com/v1/iac-index/ingest
+    description: >-
+      Your Visiblaze ingest endpoint. Required — we give you the exact URL when your organisation is
+      authorised, because it depends on which region your workspace lives in.
+    required: true
   fail-on-error:
     description: >-
       Fail the job if extraction or upload fails. Default false, and that default is deliberate:
@@ -141,6 +142,17 @@ runs:
 
         command -v jq >/dev/null 2>&1 || bail error "jq is required and was not found on this runner"
         command -v gzip >/dev/null 2>&1 || bail error "gzip is required and was not found on this runner"
+
+        # api-url is declared `required: true`, and that declaration is NOT enforced. GitHub does
+        # not validate required inputs for a composite action — a missing one simply arrives as an
+        # empty string. So the check has to live here, or the URL would be "" and curl would fail
+        # with something unrelated to the actual mistake.
+        #
+        # It has no default on purpose. The endpoint depends on which region a workspace lives in,
+        # and a default would be frozen the moment a customer pins a commit SHA — so a wrong default
+        # could never be corrected for anyone already pinned. A required input cannot silently point
+        # somewhere that does not answer.
+        [ -n "${VISIBLAZE_API:-}" ] || bail error "api-url is required — use the ingest endpoint Visiblaze gave you when your organisation was authorised"
 
         LABEL="${VISIBLAZE_LABEL:-}"
         [ -n "$LABEL" ] || LABEL="$GH_REPOSITORY"
