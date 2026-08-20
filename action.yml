@@ -1,0 +1,267 @@
+# Copyright 2026 Visiblaze
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Visiblaze — send your Terraform identity map
+#
+# ── What this does, and what it deliberately does not ──
+#
+# Connecting a failing cloud resource to the line of Terraform that declared it needs one thing:
+# a map from Terraform address to the identifiers the cloud uses for the same resource. This
+# action reads that map out of a plan you have ALREADY produced, and posts only the map.
+#
+# It never runs `plan` itself. That is not laziness — `plan` needs your cloud credentials and
+# your state backend, and this action is designed to need NEITHER. It reads a file the previous
+# step already wrote. Adding it to a pipeline grants us no access you have not already granted
+# that job.
+#
+# It never uploads the plan, the state, or your source. Measured against a real OpenTofu 1.11
+# workspace with one planted secret: the secret appeared at 6 distinct paths in a state file and
+# 23 in the JSON plan, and the binary plan file is a zip containing full state, the previous
+# state, and the raw .tf source. There is no safe document to send, so this sends none of them.
+#
+# ── There is no secret to configure ──
+#
+# Authentication is GitHub's own OIDC. The workflow needs `permissions: id-token: write`, and the
+# action mints a token that lives for minutes and states cryptographically which repository
+# produced it. Nothing is stored in your repository secrets, so there is nothing to rotate, leak,
+# or revoke — and a token captured from a log cannot be replayed against anyone else's tenant.
+#
+# Your Visiblaze admin authorises your org or repo once, on our side. Until they do, this action
+# gets a 403 and says so.
+#
+# ── Composite, not Docker, on purpose ──
+#
+# A Docker action would mean trusting an image you cannot read. This is a shell script you can
+# review in ten minutes, running on your own runner. For a tool that sits next to your cloud
+# credentials, readable beats convenient.
+name: Visiblaze IaC identity map
+description: Extract the Terraform address-to-cloud-ID map from an existing plan and send it to Visiblaze. No state, plan or source leaves your network.
+author: Visiblaze
+
+branding:
+  icon: link
+  color: blue
+
+inputs:
+  tenant:
+    description: Your Visiblaze tenant id. Required — a map seeded against the wrong tenant is not recoverable by re-running.
+    required: true
+  label:
+    description: >-
+      What to call this workspace where your team reads it, e.g. "prod/eu-west-1". This is
+      rendered verbatim in "searched <label> as of <date>", so a repository name is a poor label
+      for a repo holding several workspaces. Defaults to the repository.
+    required: false
+    default: ""
+  plan-file:
+    description: Path to the plan produced by `terraform plan -out`. Either this or plan-json must be set.
+    required: false
+    default: tfplan
+  plan-json:
+    description: Path to an already-rendered `show -json` document. Use when your pipeline has one; skips re-running show.
+    required: false
+    default: ""
+  binary:
+    description: The IaC CLI to call. `tofu` or `terraform`.
+    required: false
+    default: terraform
+  api-url:
+    description: Visiblaze ingest endpoint.
+    required: false
+    default: https://api.visiblaze.com/v1/iac-index/ingest
+  fail-on-error:
+    description: >-
+      Fail the job if extraction or upload fails. Default false, and that default is deliberate:
+      a provenance upload is an observability feature, and it must never be the reason a deploy
+      pipeline goes red. Set true if you would rather know loudly.
+    required: false
+    default: "false"
+  dry-run:
+    description: Extract and report, upload nothing. Use this for the first run so you can read exactly what would be sent.
+    required: false
+    default: "false"
+
+outputs:
+  resources:
+    description: Number of resources in the map that was sent.
+    value: ${{ steps.extract.outputs.resources }}
+  status:
+    description: One of sent, dry-run, skipped-no-prior-state, failed.
+    value: ${{ steps.extract.outputs.status }}
+
+runs:
+  using: composite
+  steps:
+    - id: extract
+      shell: bash
+      env:
+        VISIBLAZE_TENANT: ${{ inputs.tenant }}
+        VISIBLAZE_LABEL: ${{ inputs.label }}
+        VISIBLAZE_API: ${{ inputs.api-url }}
+        PLAN_FILE: ${{ inputs.plan-file }}
+        PLAN_JSON: ${{ inputs.plan-json }}
+        IAC_BIN: ${{ inputs.binary }}
+        FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        GH_REPOSITORY: ${{ github.repository }}
+      run: |
+        set -uo pipefail
+
+        # The audience pins these tokens to us. A token your workflow mints for AWS or Vault will
+        # not verify here, and one minted here is useless anywhere else — which is the property
+        # that makes a leaked token a non-event.
+        AUDIENCE="visiblaze-iac-index"
+
+        # Rows per request. The server caps a request at 5MiB decompressed and 20,000 rows, and at
+        # the ~272 bytes/row we measure those two bind at almost exactly the same point — so 20,000
+        # is only safe for average rows, and a workspace with long ARNs or many ids per resource
+        # would trip the byte limit first. 10,000 keeps roughly 2x headroom under the byte cap
+        # rather than sitting on it.
+        CHUNK=10000
+
+        # Soft failure unless the caller opted in. Two exit paths so the intent is explicit
+        # rather than buried in a trailing `|| true`.
+        bail() {
+          echo "::${1}::visiblaze: ${2}"
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          [ "$FAIL_ON_ERROR" = "true" ] && exit 1
+          exit 0
+        }
+
+        command -v jq >/dev/null 2>&1 || bail error "jq is required and was not found on this runner"
+        command -v gzip >/dev/null 2>&1 || bail error "gzip is required and was not found on this runner"
+
+        LABEL="${VISIBLAZE_LABEL:-}"
+        [ -n "$LABEL" ] || LABEL="$GH_REPOSITORY"
+
+        # Render the plan unless the caller already has one.
+        if [ -n "$PLAN_JSON" ]; then
+          [ -f "$PLAN_JSON" ] || bail error "plan-json '$PLAN_JSON' does not exist"
+          SRC="$PLAN_JSON"
+        else
+          [ -f "$PLAN_FILE" ] || bail error "plan-file '$PLAN_FILE' does not exist — run 'plan -out' first, in this same job"
+          SRC="$RUNNER_TEMP/visiblaze-plan.json"
+          "$IAC_BIN" show -json "$PLAN_FILE" > "$SRC" 2>/dev/null \
+            || bail error "'$IAC_BIN show -json' failed — is $IAC_BIN on PATH and is '$PLAN_FILE' a plan file?"
+        fi
+
+        MAP="$RUNNER_TEMP/visiblaze-identity-map.json"
+        # No `set -e` anywhere in this script, and that is load-bearing rather than an omission.
+        # Every failure here is meant to be caught by hand and routed through bail(), because the
+        # decision to fail the customer's build belongs to fail-on-error, not to bash. An earlier
+        # revision re-enabled errexit after this call and the next `code=$(curl ...)` killed the
+        # script the moment curl failed — before `rc=$?`, before the warning, before status=failed.
+        # A dead upload reported itself as a clean run.
+        bash "$GITHUB_ACTION_PATH/extract-iac-identity-map.sh" \
+          --plan "$SRC" --tenant "$VISIBLAZE_TENANT" --out "$MAP"
+        rc=$?
+
+        # 2 covers "never applied" — a real, expected state for a fresh workspace, and NOT a
+        # failure. Sending an empty map would tell Visiblaze that every cloud resource you own
+        # has no code behind it, so the extractor refuses and so do we.
+        if [ $rc -eq 2 ]; then
+          echo "::notice::visiblaze: no prior state in this plan (workspace not applied yet) — nothing to send"
+          echo "status=skipped-no-prior-state" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        [ $rc -eq 0 ] || bail error "extraction failed (exit $rc)"
+
+        COUNT=$(jq 'length' "$MAP")
+        echo "resources=$COUNT" >> "$GITHUB_OUTPUT"
+        echo "::notice::visiblaze: extracted $COUNT resources"
+
+        if [ "$DRY_RUN" = "true" ]; then
+          echo "--- first rows that WOULD be sent ---"
+          jq -r '.[0:5][] | "  \(.address)  ->  \(.native_ids | join(", "))"' "$MAP"
+          echo "status=dry-run" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # ── Mint the OIDC token ──
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          bail error "no OIDC token available — add 'permissions: id-token: write' to this job (see the README)"
+        fi
+        OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" 2>/dev/null | jq -r '.value // empty')
+        [ -n "$OIDC" ] || bail error "could not mint an OIDC token for audience '$AUDIENCE'"
+        # Mask BEFORE the token can reach any other command. It is short-lived, but a runner log on
+        # a public repository is world-readable the moment it is written, and GitHub cannot mask a
+        # value it was never told about.
+        echo "::add-mask::$OIDC"
+
+        UPDATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        BODY="$RUNNER_TEMP/visiblaze-response.txt"
+        SENT=0
+        OFFSET=0
+
+        while [ "$OFFSET" -lt "$COUNT" ]; do
+          END=$((OFFSET + CHUNK))
+          MORE=true
+          [ "$END" -ge "$COUNT" ] && MORE=false
+
+          # The extractor emits a bare array; the server refuses one, because `label` is what your
+          # team reads as "the source we searched" and there is no honest default for it.
+          #
+          # `more` is the safety interlock for chunking: the server writes resources first and the
+          # completeness marker only when more is false. A run that dies midway therefore leaves an
+          # index the server reports as INCOMPLETE — every resource answers "not checked" — rather
+          # than one that vouches for a map with holes in it, where the missing resources would
+          # read as "nobody wrote code for this".
+          CHUNK_FILE="$RUNNER_TEMP/visiblaze-chunk.json.gz"
+          jq -c --arg label "$LABEL" --arg at "$UPDATED_AT" \
+                --argjson off "$OFFSET" --argjson n "$CHUNK" --argjson more "$MORE" \
+            '{label: $label, writer: "github-actions", updated_at: $at, more: $more,
+              resources: .[$off:($off + $n)]}' "$MAP" | gzip -c > "$CHUNK_FILE"
+          if [ $? -ne 0 ]; then
+            bail error "failed to build chunk at offset $OFFSET"
+          fi
+
+          # Content-Type is octet-stream and NOT application/json, deliberately. API Gateway decides
+          # whether to base64-encode a body from its content type, and a body it treats as text is
+          # round-tripped through UTF-8 — which silently corrupts compressed bytes. Declaring the
+          # payload binary is what keeps the gzip intact end to end.
+          #
+          # --fail-with-body so a 4xx is a failure AND we can show why; the response body is the
+          # only place the server explains a rejected map.
+          code=$(curl -sS --fail-with-body -o "$BODY" -w '%{http_code}' \
+            -X POST "$VISIBLAZE_API" \
+            -H "Authorization: Bearer $OIDC" \
+            -H "X-Visiblaze-Tenant: $VISIBLAZE_TENANT" \
+            -H "Content-Type: application/octet-stream" \
+            -H "Content-Encoding: gzip" \
+            --data-binary @"$CHUNK_FILE" 2>>"$BODY")
+          rc=$?
+          rm -f "$CHUNK_FILE"
+
+          if [ $rc -ne 0 ]; then
+            # Stop the whole loop, never continue to the next chunk. Skipping a failed chunk and
+            # sending the last one would post more=false over an index missing everything that
+            # chunk carried — writing the completeness marker across a hole, which is the one
+            # outcome the interlock above exists to prevent.
+            if [ "${code:-}" = "403" ]; then
+              bail error "403 — this repository is not authorised for tenant '$VISIBLAZE_TENANT' yet. Ask your Visiblaze admin to authorise it, then re-run."
+            fi
+            # head -c: the body is server-controlled, and a runner log is world-readable on public
+            # repositories. Enough to diagnose, not enough to dump anything large into a log.
+            bail warning "upload failed at offset $OFFSET of $COUNT (HTTP ${code:-none}): $(head -c 300 "$BODY" 2>/dev/null)"
+          fi
+
+          SENT=$((SENT + CHUNK))
+          [ "$SENT" -gt "$COUNT" ] && SENT="$COUNT"
+          [ "$MORE" = "true" ] && echo "::notice::visiblaze: sent $SENT/$COUNT resources"
+          OFFSET="$END"
+        done
+
+        echo "::notice::visiblaze: sent $COUNT resources"
+        echo "status=sent" >> "$GITHUB_OUTPUT"
