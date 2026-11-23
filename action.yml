@@ -64,8 +64,16 @@ inputs:
       for a repo holding several workspaces. Defaults to the repository.
     required: false
     default: ""
+  working-directory:
+    description: >-
+      The folder holding your root module, where you ran init and plan, relative to the repository
+      (e.g. terraform/ or infra/prod). plan-file and plan-json are read relative to it, and show runs
+      in it. A job's `defaults.run.working-directory` does not reach an action's steps, so a
+      Terraform folder other than the repository root has to be named here.
+    required: false
+    default: "."
   plan-file:
-    description: Path to the plan produced by `terraform plan -out`. Either this or plan-json must be set.
+    description: Path to the plan produced by `terraform plan -out`, relative to working-directory. Either this or plan-json must be set.
     required: false
     default: tfplan
   plan-json:
@@ -73,7 +81,7 @@ inputs:
     required: false
     default: ""
   binary:
-    description: The IaC CLI to call. `tofu` or `terraform`.
+    description: The IaC CLI to call, `tofu` or `terraform` (a path to one is accepted). Anything else is refused.
     required: false
     default: terraform
   api-url:
@@ -111,12 +119,24 @@ runs:
         VISIBLAZE_LABEL: ${{ inputs.label }}
         VISIBLAZE_API: ${{ inputs.api-url }}
         PLAN_FILE: ${{ inputs.plan-file }}
+        WORKING_DIR: ${{ inputs.working-directory }}
         PLAN_JSON: ${{ inputs.plan-json }}
         IAC_BIN: ${{ inputs.binary }}
         FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
         DRY_RUN: ${{ inputs.dry-run }}
         GH_REPOSITORY: ${{ github.repository }}
+        GH_WORKSPACE: ${{ github.workspace }}
+        GH_EVENT: ${{ github.event_name }}
+        # The repository a pull request's head lives in. Differs from GH_REPOSITORY only for a pull
+        # request from a fork, the one case GitHub issues no OIDC token.
+        PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
       run: |
+        # `shell: bash` runs this as `bash --noprofile --norc -eo pipefail`, so errexit is ON before
+        # the first line no matter what follows. Without this `set +e` a failed upload killed the
+        # step at `code=$(curl --fail-with-body ...)` with exit 22, before the HTTP status, the
+        # server's message or the 403 explanation were printed (SCRUM-17391). Every failure below
+        # is handled by hand through bail(); see the note above the extractor call.
+        set +e
         set -uo pipefail
 
         # The audience pins these tokens to us. A token your workflow mints for AWS or Vault will
@@ -131,13 +151,41 @@ runs:
         # rather than sitting on it.
         CHUNK=10000
 
-        # Soft failure unless the caller opted in. Two exit paths so the intent is explicit
-        # rather than buried in a trailing `|| true`.
+        # ── Booleans, validated ──
+        #
+        # `dry-run: 'True'` used to compare unequal to "true" and perform a real upload. Anything
+        # not clearly true or false is refused, with exit 1 whatever fail-on-error says.
+        norm_bool() {
+          case "$(printf '%s' "$2" | tr 'A-Z' 'a-z')" in
+            true|yes|1|on)     printf 'true'  ;;
+            false|no|0|off|"") printf 'false' ;;
+            *) echo "::error::visiblaze: ${1} must be true or false, got '${2}'" >&2
+               printf 'invalid' ;;
+          esac
+        }
+        DRY_RUN="$(norm_bool dry-run "${DRY_RUN:-}")"
+        FAIL_ON_ERROR="$(norm_bool fail-on-error "${FAIL_ON_ERROR:-}")"
+        if [ "$DRY_RUN" = "invalid" ] || [ "$FAIL_ON_ERROR" = "invalid" ]; then
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        # bail() is AVAILABILITY (a tool missing on the runner, an extraction or upload that
+        # failed): soft unless the caller opted in. Two exit paths so the intent is explicit rather
+        # than buried in a trailing `|| true`.
         bail() {
           echo "::${1}::visiblaze: ${2}"
           echo "status=failed" >> "$GITHUB_OUTPUT"
           [ "$FAIL_ON_ERROR" = "true" ] && exit 1
           exit 0
+        }
+        # fatal() is CONFIGURATION and INTEGRITY, and ignores fail-on-error: an api-url this action
+        # may not post to, a CLI that is not terraform or tofu, a plan outside this job's files. A
+        # green job on any of them hides a workflow that sends, or runs, something it should not.
+        fatal() {
+          echo "::error::visiblaze: ${1}"
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          exit 1
         }
 
         command -v jq >/dev/null 2>&1 || bail error "jq is required and was not found on this runner"
@@ -152,7 +200,7 @@ runs:
         # and a default would be frozen the moment a customer pins a commit SHA — so a wrong default
         # could never be corrected for anyone already pinned. A required input cannot silently point
         # somewhere that does not answer.
-        [ -n "${VISIBLAZE_API:-}" ] || bail error "api-url is required — use the ingest endpoint Visiblaze gave you when your organisation was authorised"
+        [ -n "${VISIBLAZE_API:-}" ] || fatal "api-url is required — use the ingest endpoint Visiblaze gave you when your organisation was authorised"
 
         # ── And where it may point ──────────────────────────────────────────────────────
         #
@@ -177,31 +225,73 @@ runs:
         ALLOWED_API_ORIGINS='https://qwc3m6imgj.execute-api.ap-south-1.amazonaws.com'
         case "$VISIBLAZE_API" in
           https://*) ;;
-          *) bail error "api-url must be https, got '${VISIBLAZE_API}'" ;;
+          *) fatal "api-url must be https, got '${VISIBLAZE_API}'" ;;
         esac
         API_ORIGIN="$(printf '%s' "$VISIBLAZE_API" | awk -F/ '{print $1"//"$3}')"
         API_OK=""
         for ORIGIN in $ALLOWED_API_ORIGINS; do
           if [ "$API_ORIGIN" = "$ORIGIN" ]; then API_OK="yes"; break; fi
         done
-        [ -n "$API_OK" ] || bail error "api-url origin ${API_ORIGIN} is not one this action permits — the identity map may only be sent to a Visiblaze endpoint named in this action"
+        [ -n "$API_OK" ] || fatal "api-url origin ${API_ORIGIN} is not one this action permits — the identity map may only be sent to a Visiblaze endpoint named in this action"
 
         LABEL="${VISIBLAZE_LABEL:-}"
         [ -n "$LABEL" ] || LABEL="$GH_REPOSITORY"
 
+        # `binary` is executed, so it is held to the two CLIs this action knows. A workflow input
+        # naming any other program would make this step a way to run it.
+        case "$(basename -- "${IAC_BIN}")" in
+          terraform|tofu) ;;
+          *) fatal "binary must be terraform or tofu, got '${IAC_BIN}'" ;;
+        esac
+
+        # The root module's folder (SCRUM-17392). Everything below runs in it, so plan-file and
+        # plan-json are relative to it and `show` finds the .terraform it was initialised with. It
+        # must resolve inside the checkout: a path climbing out of it is another job's directory on
+        # a self-hosted runner.
+        WS_REAL="$(cd "${GH_WORKSPACE:-$PWD}" 2>/dev/null && pwd -P)"
+        case "${WORKING_DIR:-.}" in
+          /*) WD_PATH="${WORKING_DIR}" ;;
+          *) WD_PATH="${WS_REAL}/${WORKING_DIR:-.}" ;;
+        esac
+        [ -d "$WD_PATH" ] || bail error "working-directory '${WORKING_DIR}' does not exist in the checkout"
+        WD_REAL="$(cd "$WD_PATH" && pwd -P)"
+        case "${WD_REAL}/" in
+          "${WS_REAL}"/*) ;;
+          *) fatal "working-directory '${WORKING_DIR}' resolves outside the checkout — refusing to read it" ;;
+        esac
+        cd "$WD_REAL" || bail error "could not enter working-directory '${WORKING_DIR}'"
+
+        # A plan this job produced: inside the checkout or the job's temp directory, after
+        # resolving symlinks. Anywhere else, on a self-hosted runner, is another job's file, and its
+        # resource map would be sent as this workspace's.
+        within_job() {
+          local real root root_real
+          real="$(cd "$(dirname -- "$1")" 2>/dev/null && pwd -P)/$(basename -- "$1")" || return 1
+          [ -L "$1" ] && return 1
+          for root in "${GH_WORKSPACE:-$PWD}" "${RUNNER_TEMP:-}"; do
+            [ -n "$root" ] && [ -d "$root" ] || continue
+            root_real="$(cd "$root" && pwd -P)"
+            case "$real" in "$root_real"/*) return 0 ;; esac
+          done
+          return 1
+        }
+
         # Render the plan unless the caller already has one.
         if [ -n "$PLAN_JSON" ]; then
           [ -f "$PLAN_JSON" ] || bail error "plan-json '$PLAN_JSON' does not exist"
+          within_job "$PLAN_JSON" || fatal "plan-json '$PLAN_JSON' is a symlink or outside the checkout and the job's temp directory — refusing to read it"
           SRC="$PLAN_JSON"
         else
           [ -f "$PLAN_FILE" ] || bail error "plan-file '$PLAN_FILE' does not exist — run 'plan -out' first, in this same job"
+          within_job "$PLAN_FILE" || fatal "plan-file '$PLAN_FILE' is a symlink or outside the checkout and the job's temp directory — refusing to read it"
           SRC="$RUNNER_TEMP/visiblaze-plan.json"
           "$IAC_BIN" show -json "$PLAN_FILE" > "$SRC" 2>/dev/null \
-            || bail error "'$IAC_BIN show -json' failed — is $IAC_BIN on PATH and is '$PLAN_FILE' a plan file?"
+            || bail error "'$IAC_BIN show -json' failed in '${WORKING_DIR:-.}' — is $IAC_BIN on PATH, was init run there, and is '$PLAN_FILE' a plan file?"
         fi
 
         MAP="$RUNNER_TEMP/visiblaze-identity-map.json"
-        # No `set -e` anywhere in this script, and that is load-bearing rather than an omission.
+        # No `set -e` anywhere in this script (and `set +e` at its top undoes the one GitHub adds),
+        # and that is load-bearing rather than an omission.
         # Every failure here is meant to be caught by hand and routed through bail(), because the
         # decision to fail the customer's build belongs to fail-on-error, not to bash. An earlier
         # revision re-enabled errexit after this call and the next `code=$(curl ...)` killed the
@@ -233,16 +323,32 @@ runs:
         fi
 
         # ── Mint the OIDC token ──
+        #
+        # A pull request from a FORK gets no token whatever the workflow asks for. Nothing can be
+        # sent; that is said, and it is not a failure of anything the contributor can fix.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ "${GH_EVENT:-}" = "pull_request" ] \
+           && [ -n "${PR_HEAD_REPO:-}" ] && [ "${PR_HEAD_REPO}" != "${GH_REPOSITORY:-}" ]; then
+          echo "::warning::visiblaze: this pull request comes from a fork (${PR_HEAD_REPO}), and GitHub issues no OIDC token to fork pull requests. Extracted ${COUNT} resources; nothing was sent."
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
         if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
           bail error "no OIDC token available — add 'permissions: id-token: write' to this job (see the README)"
         fi
-        OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+        # Both bearer values reach curl through --config on a private file, written by printf (a
+        # builtin, so on no argv): argv is readable by every user on a shared self-hosted runner.
+        CFG_DIR="$(mktemp -d)"; chmod 700 "$CFG_DIR"
+        trap 'rm -rf "$CFG_DIR"' EXIT
+        ( umask 077; printf 'header = "Authorization: bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > "$CFG_DIR/mint.cfg" )
+        OIDC=$(curl -sS --config "$CFG_DIR/mint.cfg" \
           "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" 2>/dev/null | jq -r '.value // empty')
+        rm -f "$CFG_DIR/mint.cfg"
         [ -n "$OIDC" ] || bail error "could not mint an OIDC token for audience '$AUDIENCE'"
         # Mask BEFORE the token can reach any other command. It is short-lived, but a runner log on
         # a public repository is world-readable the moment it is written, and GitHub cannot mask a
         # value it was never told about.
         echo "::add-mask::$OIDC"
+        ( umask 077; printf 'header = "Authorization: Bearer %s"\n' "$OIDC" > "$CFG_DIR/upload.cfg" )
 
         UPDATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         BODY="$RUNNER_TEMP/visiblaze-response.txt"
@@ -279,8 +385,8 @@ runs:
           # --fail-with-body so a 4xx is a failure AND we can show why; the response body is the
           # only place the server explains a rejected map.
           code=$(curl -sS --fail-with-body -o "$BODY" -w '%{http_code}' \
+            --config "$CFG_DIR/upload.cfg" \
             -X POST "$VISIBLAZE_API" \
-            -H "Authorization: Bearer $OIDC" \
             -H "X-Visiblaze-Tenant: $VISIBLAZE_TENANT" \
             -H "Content-Type: application/octet-stream" \
             -H "Content-Encoding: gzip" \

@@ -106,13 +106,21 @@ needs no `id-token` permission, because it never authenticates.
 | Input | Default | Notes |
 |---|---|---|
 | `tenant` | — | **Required.** A map seeded against the wrong tenant is not recoverable by re-running. |
+| `working-directory` | `.` | The folder holding your root module (where you ran `init` and `plan`), relative to the repository, e.g. `terraform/`. `plan-file` and `plan-json` are read relative to it. A job's `defaults.run.working-directory` does not apply inside an action, so a Terraform folder other than the root must be named here. |
 | `api-url` | — | **Required.** The ingest endpoint we give you. There is deliberately no default: the endpoint depends on which region your workspace lives in, and a default would be frozen the moment you pin a commit SHA — so a wrong one could never be corrected for anyone already pinned. |
 | `label` | the repository | What your team reads in *"searched **&lt;label&gt;** as of &lt;date&gt;"*. Name the **workspace** — `prod/eu-west-1`, not `acme/infra`. The repo name is a poor label for a repo holding several workspaces. |
-| `plan-file` | `tfplan` | The output of `plan -out`. |
-| `plan-json` | — | Use if your pipeline already rendered `show -json`. |
-| `binary` | `terraform` | Set to `tofu` for OpenTofu. |
+| `plan-file` | `tfplan` | The output of `plan -out`. Must be inside the checkout or `RUNNER_TEMP`, and not a symlink. |
+| `plan-json` | — | Use if your pipeline already rendered `show -json`. Same location rule. |
+| `binary` | `terraform` | Set to `tofu` for OpenTofu. Only these two are accepted (a path to either is fine). |
 | `fail-on-error` | `false` | See below. |
 | `dry-run` | `false` | Extract and report; send nothing. |
+
+Booleans accept `true`/`false`, `yes`/`no`, `1`/`0` and `on`/`off`; anything else, an `api-url` this
+action may not post to, a `binary` that is not terraform or tofu, or a plan outside this job's files
+fails the job whatever `fail-on-error` says.
+
+On a pull request from a **fork** GitHub issues no OIDC token: the map is extracted, nothing is
+sent, a warning says so, and the job is not failed.
 
 There is no `token` input. If you are looking for one, see the section above.
 
